@@ -1,12 +1,15 @@
 /* 고객 한마디 분류기 — 화면.
  *
  * 흐름: 문장 → 가림(mask.js, 브라우저 안) → AI(api/classify) → 실패하면 규칙(rules.js)
- * 채점: 정답 100건을 규칙으로, 또는 AI로(20건씩 다섯 번) 돌려 맞힌 비율을 잰다.
+ * 채점: 정답 100건을 규칙으로, 또는 AI로(10건씩 열 번) 돌려 맞힌 비율을 잰다.
  */
 (function () {
   "use strict";
   const $ = s => document.querySelector(s);
-  const S = { criteria: null, test: [], practice: [], aiResults: null };
+  const S = { criteria: null, test: [], practice: [], aiResults: null, serverDefault: null };
+  // AI 채점 때 한 번에 보내는 문장 수. 서버의 MAX_TEXTS(20) 보다 작게 둔다 —
+  // 묶음이 작을수록 모델이 느려도 서버의 대기 한도(60초) 안에 답한다.
+  const BATCH = 10;
 
   async function load() {
     const [c, t, p] = await Promise.all([
@@ -24,13 +27,76 @@
     ["try", "score", "rules"].forEach(k => { $("#tab-" + k).hidden = k !== b.dataset.tab; });
   }));
 
+  // ── AI 모델 고르기 ───────────────────────────────────
+  // 모델 이름은 자주 바뀐다. 아래 5개는 2026-11-06 에 공식 가격표(aistudio.google.com/docs/pricing)에서
+  // «Free tier 무료»로 표시된 글쓰기(텍스트) 모델 중에서 직접 확인해 골랐다.
+  // 음성·TTS·번역·임베딩 모델과 지원 중단 표시가 붙은 모델(2.5 Pro · 2.5 Flash)은 뺐다.
+  // 무료 한도(하루 요청 수)는 가격표에 없고 AI Studio 에 로그인해야 보인다 — 근거를 못 찾았다.
+  // 그래서 순서는 «추정»이다: 한도 순이 아니라 «최신·일반 모델 먼저, 프리뷰는 맨 뒤».
+  // 목록에 없는 이름은 «직접 입력…» 으로 쓴다.
+  const MODELS = [
+    { id: "gemini-3.8-flash" },
+    { id: "gemini-3.5-flash-lite" },
+    { id: "gemini-3.1-flash-lite" },
+    { id: "gemini-2.5-flash-lite" },
+    { id: "gemini-3-flash-preview", tag: "프리뷰" },
+  ];
+  const SEL_KEY = "classifier.model.sel", CUSTOM_KEY = "classifier.model.custom", CUSTOM = "__custom__";
+  const selEl = $("#model-select"), customEl = $("#model-custom");
+
+  // 시크릿 창 등에서 localStorage 를 못 써도 앱은 멀쩡히 돈다
+  function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+  function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* 기억만 못 할 뿐이다 */ } }
+
+  function addOption(value, label) {
+    const o = document.createElement("option");
+    o.value = value; o.textContent = label; selEl.appendChild(o);
+  }
+  addOption("", "서버 기본값");
+  MODELS.forEach(m => addOption(m.id, m.id + (m.tag ? ` (${m.tag})` : "")));
+  addOption(CUSTOM, "직접 입력…");
+
+  // 서버에 보낼 모델 이름. «서버 기본값»(또는 빈 직접 입력)이면 빈 문자열
+  function currentModel() { return selEl.value === CUSTOM ? customEl.value.trim() : selEl.value; }
+
+  function renderModelLine() {
+    const m = currentModel();
+    $("#model-line").textContent = m ? `지금 ${m} 로 호출합니다`
+      : S.serverDefault ? `서버 기본값 — 지금 ${S.serverDefault} 로 호출합니다`
+      : "서버 기본값으로 호출합니다 — 서버에 닿으면 그 이름이 여기 보입니다";
+  }
+
+  const savedSel = lsGet(SEL_KEY);
+  if ([...selEl.options].some(o => o.value === savedSel)) selEl.value = savedSel;
+  customEl.value = lsGet(CUSTOM_KEY) || "";
+  customEl.hidden = selEl.value !== CUSTOM;
+  renderModelLine();
+
+  selEl.addEventListener("change", () => {
+    lsSet(SEL_KEY, selEl.value);
+    customEl.hidden = selEl.value !== CUSTOM;
+    if (!customEl.hidden) customEl.focus();
+    renderModelLine();
+  });
+  customEl.addEventListener("input", () => { lsSet(CUSTOM_KEY, customEl.value); renderModelLine(); });
+
+  // «서버 기본값» 이 어떤 모델인지 서버에 묻는다. 로컬에는 서버 함수가 없어 실패해도 정상이다
+  async function loadServerDefault() {
+    try {
+      const r = await fetch("api/classify");
+      if (!r.ok) return;
+      const d = await r.json();
+      if (d && typeof d.default === "string") { S.serverDefault = d.default; renderModelLine(); }
+    } catch (e) { /* 서버 함수 없음 */ }
+  }
+
   // ── AI 호출 ─────────────────────────────────────────
-  async function askAI(maskedTexts) {
+  async function askAI(maskedTexts, model = currentModel()) {
     try {
       const r = await fetch("api/classify", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ texts: maskedTexts, criteria: S.criteria }),
+        body: JSON.stringify({ texts: maskedTexts, criteria: S.criteria, model }),
       });
       if (!r.ok) return { results: null, reason: `서버 함수가 없습니다 (${r.status}) — 배포하면 생깁니다` };
       return await r.json();
@@ -116,15 +182,23 @@
     btn.disabled = true;
     const masked = S.test.map(r => Mask.mask(r.text).masked);
     const results = [];
-    for (let i = 0; i < masked.length; i += 20) {
+    const model = currentModel();   // 채점 도중 드롭다운을 바꿔도 이번 채점은 한 모델로 끝낸다
+    const used = [];                // 서버가 실제로 쓴 모델 이름
+    for (let i = 0; i < masked.length; i += BATCH) {
+      const batch = masked.slice(i, i + BATCH);
       btn.textContent = `AI 채점 중… ${i}/${masked.length}`;
-      const r = await askAI(masked.slice(i, i + 20));
+      let r = await askAI(batch, model);
+      if (r.timeout) {              // 느리면 그 묶음만 한 번 더 시도한다
+        btn.textContent = `AI 채점 중… ${i}/${masked.length} · 다시 시도`;
+        r = await askAI(batch, model);
+      }
       if (!r.results) {
         $("#score-msg").hidden = false;
-        $("#score-msg").textContent = `AI로 채점하지 못했습니다 — ${r.reason}`;
+        $("#score-msg").textContent = `AI로 채점하지 못했습니다 — ${r.reason}${r.timeout ? " (두 번 시도했습니다)" : ""}`;
         btn.disabled = false; btn.textContent = "AI로 채점";
         return;
       }
+      if (r.model && !used.includes(r.model)) used.push(r.model);
       results.push(...r.results);
     }
     // 답을 못 받은 문장은 «오답»으로 센다 — 빠진 것을 빼고 세면 점수가 부풀려진다
@@ -132,6 +206,7 @@
     S.aiResults = results;
     const s = Rules.score(S.test, (r, i) => results[i] || miss);
     showScore("ai", s);
+    $("#th-ai").textContent = used.length ? "AI · " + used.join(", ") : "AI";
     const blank = results.filter(x => !x).length;
     $("#score-msg").hidden = !blank;
     if (blank) $("#score-msg").textContent = `AI가 답하지 않은 문장 ${blank}건은 오답으로 셌습니다.`;
@@ -159,5 +234,6 @@
   }
 
   load();
+  loadServerDefault();
 })();
 
